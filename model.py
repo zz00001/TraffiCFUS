@@ -1,31 +1,175 @@
-"""
-An Lao
-"""
 import math
 import logging
-import random
 import torch
 import torch.fft
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-
-from urbanclip_model import Residual, ParallelTransformerBlock, CrossAttention, LayerNorm
+from timm.models.layers import to_2tuple, trunc_normal_
+from einops import rearrange
+from torch import einsum, nn
 
 _logger = logging.getLogger(__name__)
 
 pi = 3.1415926535
 
-def print_check(text, image, bilinear):
-    print('Check value:')
-    if text is not None:
-        print('text:\n', text[0][0])
-    if image is not None:
-        print('image:\n', image[0][0])
-    if bilinear is not None:
-        print('bilinear:\n', bilinear[0][0])
-    print('-' * 50)
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, *args, **kwargs):
+        return self.fn(x, *args, **kwargs) + x
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, max_seq_len, *, device):
+        seq = torch.arange(max_seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = einsum("i , j -> i j", seq, self.inv_freq)
+        return torch.cat((freqs, freqs), dim=-1)
+
+class SwiGLU(nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim=-1)
+        return F.silu(gate) * x
+
+def rotate_half(x):
+    x = rearrange(x, "... (j d) -> ... j d", j=2)
+    x1, x2 = x.unbind(dim=-2)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(pos, t):
+    return (t * pos.cos()) + (rotate_half(t) * pos.sin())
+
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+class ParallelTransformerBlock(nn.Module):
+    def __init__(self, dim, dim_head=64, heads=8, ff_mult=4):
+        super().__init__()
+        self.norm = LayerNorm(dim)
+
+        attn_inner_dim = dim_head * heads
+        ff_inner_dim = dim * ff_mult
+        self.fused_dims = (attn_inner_dim, dim_head, dim_head, (ff_inner_dim * 2))
+
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        self.rotary_emb = RotaryEmbedding(dim_head)
+
+        self.fused_attn_ff_proj = nn.Linear(dim, sum(self.fused_dims), bias=False)
+        self.attn_out = nn.Linear(attn_inner_dim, dim, bias=False)
+
+        self.ff_out = nn.Sequential(
+            SwiGLU(),
+            nn.Linear(ff_inner_dim, dim, bias=False)
+        )
+
+        self.mask = None
+        self.pos_emb = None
+
+    def get_mask(self, n, device):
+        if self.mask is not None and self.mask.shape[-1] >= n:
+            return self.mask[:n, :n].to(device)
+
+        mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
+        self.mask = mask
+        return mask
+
+    def get_rotary_embedding(self, n, device):
+        if self.pos_emb is not None and self.pos_emb.shape[-2] >= n:
+            return self.pos_emb[:n].to(device)
+
+        pos_emb = self.rotary_emb(n, device=device)
+        self.pos_emb = pos_emb
+        return pos_emb
+
+    def forward(self, x, attn_mask=None):
+        n, device, h = x.shape[1], x.device, self.heads
+        x = self.norm(x)
+        q, k, v, ff = self.fused_attn_ff_proj(x).split(self.fused_dims, dim=-1)
+        q = rearrange(q, "b n (h d) -> b h n d", h=h)
+        positions = self.get_rotary_embedding(n, device)
+        q, k = map(lambda t: apply_rotary_pos_emb(positions, t), (q, k))
+        q = q * self.scale
+        sim = einsum("b h i d, b j d -> b h i j", q, k)
+        causal_mask = self.get_mask(n, device)
+        sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+        if exists(attn_mask):
+            attn_mask = rearrange(attn_mask, 'b i j -> b 1 i j')
+            sim = sim.masked_fill(~attn_mask, -torch.finfo(sim.dtype).max)
+        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
+        attn = sim.softmax(dim=-1)
+        out = einsum("b h i j, b j d -> b h i d", attn, v)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        return self.attn_out(out) + self.ff_out(ff)
+
+class CrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        context_dim=None,
+        dim_head=64,
+        heads=8,
+        parallel_ff=False,
+        ff_mult=4,
+        norm_context=False
+    ):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        inner_dim = heads * dim_head
+        context_dim = default(context_dim, dim)
+
+        self.norm = LayerNorm(dim)
+        self.context_norm = LayerNorm(context_dim) if norm_context else nn.Identity()
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(context_dim, dim_head * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+        # whether to have parallel feedforward
+
+        ff_inner_dim = ff_mult * dim
+
+        self.ff = nn.Sequential(
+            nn.Linear(dim, ff_inner_dim * 2, bias=False),
+            SwiGLU(),
+            nn.Linear(ff_inner_dim, dim, bias=False)
+        ) if parallel_ff else None
+
+    def forward(self, x, context):
+        x = self.norm(x)
+        context = self.context_norm(context)
+        q = self.to_q(x)
+        q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
+        q = q * self.scale
+        k, v = self.to_kv(context).chunk(2, dim=-1)
+        sim = einsum('b h i d, b j d -> b h i j', q, k)
+        sim = sim - sim.amax(dim=-1, keepdim=True)
+        attn = sim.softmax(dim=-1)
+        out = einsum('b h i j, b j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+        if exists(self.ff):
+            out = out + self.ff(x)
+        return out
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.register_buffer("beta", torch.zeros(dim))
+
+    def forward(self, x):
+        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
 
 class TextPositionEmbed(nn.Module):
     def __init__(self, seq_len, d_model=128, dropout=0.):
@@ -90,7 +234,6 @@ class Image2TextGate(nn.Module):
         image = image * torch.view_as_complex(self.select_para)
         image = image.permute(0, 2, 1)  # (B, C, N)
         image = self.avg_pool(image.real)  # (B, C, 1)
-        image = self.conv_layer(image)  # (B, C, 1)
         image = image.permute(0, 2, 1)  # (B, 1, C)
         return image
 
@@ -106,7 +249,6 @@ class Text2ImageGate(nn.Module):
         text = text * torch.view_as_complex(self.select_para)  # (B, S, C)
         text = text.permute(0, 2, 1)
         text = self.avg_pool(text.real)  # (B, C, 1)
-        text = self.conv_layer(text)  # (B, C, 1)
         text = text.permute(0, 2, 1)  # (B, 1, C)
         return text
 
@@ -117,9 +259,6 @@ class ImageFrequencySelection(nn.Module):
         self.text_gate = Text2ImageGate(s, d_model)
 
     def forward(self, image, text):
-        """
-        image: (B, N, C)  N=h*w  in frequency domain
-        """
         text_gate = self.text_gate(text)
         image = image * text_gate
         return image
@@ -193,11 +332,6 @@ class FtLayer(nn.Module):
 
         x_image = image
         B, N, C = image.shape
-        assert N // 2 + 1 == self.n
-        # if spatial_size:
-        #     a, b = spatial_size
-        # else:
-        #     a = b = int(math.sqrt(N))
 
         # fft
         _text = torch.fft.rfft(text, dim=1, norm='ortho')
@@ -217,9 +351,7 @@ class FtLayer(nn.Module):
         # ifft
         text = torch.fft.irfft(_text, n=S, dim=1, norm='ortho')
         image = torch.fft.irfft(_image, n=N, dim=1, norm='ortho')
-        # image = image.view(B, N, C)
 
-        # add & norm
         text = self.text_add_norm(text + x_text)
         image = self.image_add_norm(image + x_image)
 
@@ -227,13 +359,6 @@ class FtLayer(nn.Module):
 
 class FtBlock(nn.Module):
     def __init__(self, d_model, s, n, num_layer=1, num_filter=2, dropout=0.):
-        """
-        :param d_model:
-        :param s: seq_len / 2 + 1
-        :param h:
-        :param w:
-        :param n:
-        """
         super(FtBlock, self).__init__()
         self.ft = nn.ModuleList([FtLayer(d_model, s, n, num_filter, dropout) for _ in range(num_layer)])
 
@@ -296,85 +421,11 @@ class MLP(nn.Module):
         x = self.fc3(x)
         return x, features
 
-class FSRU(nn.Module):
+class TraffiCFUS(nn.Module):
     def __init__(self, W, vocab_size, d_text, seq_len, img_size, patch_size, d_model,
                  num_filter, num_class, num_layer, dropout=0., mlp_ratio=4.):
-        super(FSRU, self).__init__()
+        super(TraffiCFUS, self).__init__()
 
-        # Text
-        self.text_embed = nn.Embedding(vocab_size, d_text)
-        self.text_embed.weight = nn.Parameter(torch.from_numpy(W))
-        self.text_encoder = nn.Sequential(nn.Linear(d_text, d_model),
-                                          nn.LayerNorm(d_model),
-                                          TextPositionEmbed(seq_len, d_model, dropout))
-        s = seq_len // 2 + 1
-
-        # Image
-        self.img_patch_embed = ImagePatchEmbed(img_size, patch_size, d_model)
-        num_img_patches = self.img_patch_embed.num_patches
-        self.img_pos_embed = nn.Parameter(torch.zeros(1, num_img_patches, d_model))
-        self.img_pos_drop = nn.Dropout(p=dropout)
-        img_len = (img_size // patch_size) * (img_size // patch_size)
-        n = img_len // 2 + 1
-
-        self.FourierTransormer = FtBlock(d_model, s, n, num_layer, num_filter, dropout)
-
-        self.fusion = Fusion(d_model)
-
-        self.mlp = MLP(d_model, int(mlp_ratio*d_model), d_model, num_class, dropout=dropout)
-
-        trunc_normal_(self.img_pos_embed, std=.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.xavier_normal_(m.weight.data)
-            nn.init.constant_(m.bias.data, 0.0)
-            # trunc_normal_(m.weight, std=.02)
-        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
-            nn.init.constant_(m.weight, 1.0)
-            nn.init.constant_(m.bias, 0.)
-
-    def forward(self, text, image):
-        text = text.long()
-        text = self.text_embed(text)  # (batch, seq, dim)
-        text = self.text_encoder(text)
-
-        image = image.to(torch.float32)
-        image = self.img_patch_embed(image)
-        image = image + self.img_pos_embed
-        image = self.img_pos_drop(image)
-
-        text, image = self.FourierTransormer(text, image)
-
-        text = torch.max(text, dim=1)[0]
-        image = torch.max(image, dim=1)[0]
-
-        f = self.fusion(text, image)  # (batch, d_model)
-
-        outputs = self.mlp(f)
-
-        return text, image, outputs, f
-
-def truncated_normal_fill(shape, mean=0., std=1., limit=2.):
-    num_examples = 8
-    tmp = torch.empty(shape + (num_examples,)).normal_()
-    valid = (tmp < limit) & (tmp > -limit)
-    _, ind = valid.max(-1, keepdim=True)
-    return tmp.gather(-1, ind).squeeze(-1).mul_(std).add_(mean)
-
-def _init_weights(m, init_std=0.01):
-    for key, val in m.named_parameters():
-        if "weight" in key or "bias" in key:
-            val.data.copy_(truncated_normal_fill(val.data.shape, std=init_std))
-
-# FSRU模型集成UrbanCLIP组件
-class FSRU_new(nn.Module):
-    def __init__(self, W, vocab_size, d_text, seq_len, img_size, patch_size, d_model,
-                 num_filter, num_class, num_layer, dropout=0., mlp_ratio=4.):
-        super(FSRU_new, self).__init__()
-
-        # 文本
         self.text_embed = nn.Embedding(vocab_size, d_text)
         self.text_embed.weight = nn.Parameter(torch.from_numpy(W),)
         self.text_encoder = nn.Sequential(nn.Linear(d_text, d_model),
@@ -382,7 +433,6 @@ class FSRU_new(nn.Module):
                                           TextPositionEmbed(seq_len, d_model, dropout))
         s = seq_len // 2 + 1
 
-        # 图像
         self.img_patch_embed = ImagePatchEmbed(img_size, patch_size, d_model)
         num_img_patches = self.img_patch_embed.num_patches
         self.img_pos_embed = nn.Parameter(torch.zeros(1, num_img_patches, d_model))
@@ -392,11 +442,9 @@ class FSRU_new(nn.Module):
 
         self.FourierTransormer = FtBlock(d_model, s, n, num_layer, num_filter, dropout)
 
-        # 融合和MLP
         self.fusion = Fusion(d_model)
         self.mlp = MLP(d_model, int(mlp_ratio * d_model), d_model, num_class, dropout=dropout)
 
-        # UrbanCLIP组件
         self.multimodal_layers = nn.ModuleList([
             nn.ModuleList([
                 Residual(ParallelTransformerBlock(dim=d_model, dim_head=64, heads=8, ff_mult=4)),
@@ -433,150 +481,17 @@ class FSRU_new(nn.Module):
 
         text, image = self.FourierTransormer(text, image)
 
-        # 融合和MLP分支
         text_fusion = torch.max(text, dim=1)[0]
         image_fusion = torch.max(image, dim=1)[0]
         f = self.fusion(text_fusion, image_fusion)  # (batch, d_model)
         outputs, features = self.mlp(f, need_tsne_data)
 
         if need_tsne_data:
-            return text_fusion, image_fusion, outputs, f, features, text_embed
+            return text_fusion, image_fusion, outputs, f, features
 
-        # 多模态层和to_logits分支
         for attn_ff, cross_attn in self.multimodal_layers:
             text = attn_ff(text)
             text = cross_attn(text, image)
         logits = self.to_logits(text)
 
-        return text_fusion, image_fusion, outputs, f, logits, text_embed
-
-
-class FSRU_new_without_fusion(nn.Module):
-    def __init__(self, W, vocab_size, d_text, seq_len, img_size, patch_size, d_model,
-                 num_filter, num_class, num_layer, dropout=0., mlp_ratio=4.):
-        super(FSRU_new_without_fusion, self).__init__()
-
-        # 文本
-        self.text_embed = nn.Embedding(vocab_size, d_text)
-        self.text_embed.weight = nn.Parameter(torch.from_numpy(W),)
-        self.text_encoder = nn.Sequential(nn.Linear(d_text, d_model),
-                                          nn.LayerNorm(d_model),
-                                          TextPositionEmbed(seq_len, d_model, dropout))
-        s = seq_len // 2 + 1
-
-        # 图像
-        self.img_patch_embed = ImagePatchEmbed(img_size, patch_size, d_model)
-        num_img_patches = self.img_patch_embed.num_patches
-        self.img_pos_embed = nn.Parameter(torch.zeros(1, num_img_patches, d_model))
-        self.img_pos_drop = nn.Dropout(p=dropout)
-        img_len = (img_size // patch_size) * (img_size // patch_size)
-        n = img_len // 2 + 1
-
-        self.FourierTransormer = FtBlock(d_model, s, n, num_layer, num_filter, dropout)
-
-        # 融合和MLP
-        self.fusion = Fusion(d_model)
-        self.mlp = MLP(2*d_model, int(mlp_ratio * 2 * d_model), d_model, num_class, dropout=dropout)
-
-        # UrbanCLIP组件
-        self.multimodal_layers = nn.ModuleList([
-            nn.ModuleList([
-                Residual(ParallelTransformerBlock(dim=d_model, dim_head=64, heads=8, ff_mult=4)),
-                Residual(CrossAttention(dim=d_model, dim_head=64, heads=8, parallel_ff=True, ff_mult=4))
-            ]) for _ in range(num_layer)
-        ])
-        self.to_logits = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, W.shape[0])
-        )
-
-        trunc_normal_(self.img_pos_embed, std=.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.xavier_normal_(m.weight.data)
-            if m.bias is not None:
-                nn.init.constant_(m.bias.data, 0.0)
-        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
-            nn.init.constant_(m.weight, 1.0)
-            nn.init.constant_(m.bias, 0.)
-
-    def forward(self, text, image, need_tsne_data=False):
-        text = text.long()
-        text = self.text_embed(text)  # (batch, seq, dim)
-        text_embed = text
-        text = self.text_encoder(text)
-
-        image = image.to(torch.float32)
-        image = self.img_patch_embed(image)
-        image = image + self.img_pos_embed
-        image = self.img_pos_drop(image)
-
-        text, image = self.FourierTransormer(text, image)
-
-        # 融合和MLP分支
-        text_fusion = torch.max(text, dim=1)[0]
-        image_fusion = torch.max(image, dim=1)[0]
-        f = torch.cat((text_fusion, image_fusion), dim=1)
-        # outputs = self.mlp(f)
-        outputs, features = self.mlp(f, need_tsne_data)
-
-        if need_tsne_data:
-            return text_fusion, image_fusion, outputs, f, features, text_embed
-
-        # 多模态层和to_logits分支
-        for attn_ff, cross_attn in self.multimodal_layers:
-            text = attn_ff(text)
-            text = cross_attn(text, image)
-        logits = self.to_logits(text)
-
-        return text_fusion, image_fusion, outputs, f, logits, text_embed
-
-def main():
-    # Define model parameters
-    model_params = {
-        'W': torch.randn(10000, 512).numpy(),  # Example pre-trained word vectors
-        'vocab_size': 10000,
-        'd_text': 512,
-        'seq_len': 128,
-        'img_size': 256,
-        'patch_size': 16,
-        'd_model': 512,
-        'num_filter': 2,
-        'num_class': 10,
-        'num_layer': 6,
-        'dropout': 0.1,
-        'mlp_ratio': 4.0
-    }
-
-    # Create the FSRU model
-    model = FSRU(**model_params)
-
-    # Print the model structure
-    print(model)
-
-    # 定义模型参数
-    model_params = {
-        'W': torch.randn(10000, 512).numpy(),  # 示例预训练词向量
-        'vocab_size': 10000,
-        'd_text': 512,
-        'seq_len': 128,
-        'img_size': 256,
-        'patch_size': 16,
-        'd_model': 512,
-        'num_filter': 2,
-        'num_class': 10,
-        'num_layer': 6,
-        'dropout': 0.1,
-        'mlp_ratio': 4.0
-    }
-
-    # 创建FSRU_new模型
-    model = FSRU_new(**model_params)
-
-    # 输出模型结构
-    print(model)
-
-if __name__ == "__main__":
-    main()
+        return text_fusion, image_fusion, outputs, f, logits

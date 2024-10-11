@@ -1,17 +1,14 @@
-"""
-An Lao
-"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 eps = 1e-5
-T1 = 0.05  # 0.05
-T2 = 0.05  # 0.05
+T1 = 0.05
+T2 = 0.05
 
-class SelfContrastiveLoss(nn.Module):
+class UnsupervisedContrastiveLoss(nn.Module):
     def __init__(self, batch_size, device='cuda', temperature=T1):
-        super(SelfContrastiveLoss, self).__init__()
+        super(UnsupervisedContrastiveLoss, self).__init__()
         self.batch_size = batch_size
         self.register_buffer("temperature", torch.tensor(temperature).to(device))
         self.register_buffer("negatives_mask", (
@@ -41,54 +38,48 @@ class SelfContrastiveLoss(nn.Module):
 
         return loss
 
-class FullContrastiveLoss(nn.Module):
-    def __init__(self, batch_size, num_r, num_nr, device='cuda', temperature=T2):
-        super(FullContrastiveLoss, self).__init__()
+class SupervisedContrastiveLoss(nn.Module):
+    def __init__(self, batch_size, num_type_1, num_type_0, device='cuda', temperature=T2):
+        super(SupervisedContrastiveLoss, self).__init__()
         self.batch_size = batch_size
-        self.num_r = num_r
-        self.num_nr = num_nr
+        self.num_type_1 = num_type_1
+        self.num_type_0 = num_type_0
 
-        self.register_buffer("temperature", torch.tensor(temperature).to(device))  # 超参数 温度
-        self.register_buffer("rumor_mask", (~torch.eye(num_r, num_r, dtype=torch.bool).to(device)).float())
-        self.register_buffer("nonrumor_mask", (~torch.eye(num_nr, num_nr, dtype=torch.bool).to(device)).float())
+        self.register_buffer("temperature", torch.tensor(temperature).to(device))
+        self.register_buffer("type_1_mask", (~torch.eye(num_type_1, num_type_1, dtype=torch.bool).to(device)).float())
+        self.register_buffer("type_0_mask", (~torch.eye(num_type_0, num_type_0, dtype=torch.bool).to(device)).float())
 
     def compute_loss(self, feature, label):
-        """
-        feature: (batch, dim)
-        r: rumor nr: non-rumor
-        """
-        index_r = torch.nonzero(label).squeeze()
-        index_nr = torch.nonzero(label == 0).squeeze()
-        ft_r = torch.index_select(feature, dim=0, index=index_r)
-        ft_nr = torch.index_select(feature, dim=0, index=index_nr)
+        index_1 = torch.nonzero(label).squeeze()
+        index_0 = torch.nonzero(label == 0).squeeze()
+        ft_1 = torch.index_select(feature, dim=0, index=index_1)
+        ft_0 = torch.index_select(feature, dim=0, index=index_0)
 
-        similarity_matrix_r = F.cosine_similarity(ft_r.unsqueeze(1), ft_r.unsqueeze(0), dim=2)
-        similarity_matrix_nr = F.cosine_similarity(ft_nr.unsqueeze(1), ft_nr.unsqueeze(0), dim=2)
-        similarity_matrix_r_nr = F.cosine_similarity(ft_r.unsqueeze(1), ft_nr.unsqueeze(0), dim=2)
-        similarity_matrix_nr_r = F.cosine_similarity(ft_nr.unsqueeze(1), ft_r.unsqueeze(0), dim=2)
+        similarity_matrix_11 = F.cosine_similarity(ft_1.unsqueeze(1), ft_1.unsqueeze(0), dim=2)
+        similarity_matrix_00 = F.cosine_similarity(ft_0.unsqueeze(1), ft_0.unsqueeze(0), dim=2)
+        similarity_matrix_10 = F.cosine_similarity(ft_1.unsqueeze(1), ft_0.unsqueeze(0), dim=2)
+        similarity_matrix_01 = F.cosine_similarity(ft_0.unsqueeze(1), ft_1.unsqueeze(0), dim=2)
 
-        nominator_r = torch.sum(self.rumor_mask * torch.exp(similarity_matrix_r / self.temperature), dim=1)
-        nominator_nr = torch.sum(self.nonrumor_mask * torch.exp(similarity_matrix_nr / self.temperature), dim=1)
+        nominator_1 = torch.sum(self.type_1_mask * torch.exp(similarity_matrix_11 / self.temperature), dim=1)
+        nominator_0 = torch.sum(self.type_0_mask * torch.exp(similarity_matrix_00 / self.temperature), dim=1)
 
-        denominator_r = nominator_r + torch.sum(torch.torch.exp(similarity_matrix_r_nr / self.temperature), dim=1)
-        denominator_nr = nominator_nr + torch.sum(torch.torch.exp(similarity_matrix_nr_r / self.temperature), dim=1)
+        denominator_1 = nominator_1 + torch.sum(torch.torch.exp(similarity_matrix_10 / self.temperature), dim=1)
+        denominator_0 = nominator_0 + torch.sum(torch.torch.exp(similarity_matrix_01 / self.temperature), dim=1)
 
-        loss_r = torch.sum(-torch.log(nominator_r / denominator_r + eps)) / self.num_r
-        loss_nr = torch.sum(-torch.log(nominator_nr / denominator_nr + eps)) / self.num_nr
-        loss = loss_r + loss_nr
+        loss_1 = torch.sum(-torch.log(nominator_1 / denominator_1 + eps)) / self.num_type_1
+        loss_0 = torch.sum(-torch.log(nominator_0 / denominator_0 + eps)) / self.num_type_0
+        loss = loss_1 + loss_0
         return loss
 
     def forward(self, text, image, label):
         text = F.normalize(text, dim=1)
         image = F.normalize(image, dim=1)
-
         loss = self.compute_loss(text, label) + self.compute_loss(image, label)
-
         return loss
 
-class CaptionLoss(nn.Module):
+class MultimodalInteractionLoss(nn.Module):
     def __init__(self, pad_id=0):
-        super(CaptionLoss, self).__init__()
+        super(MultimodalInteractionLoss, self).__init__()
         self.pad_id = pad_id
 
     def forward(self, logits, text):
@@ -96,27 +87,7 @@ class CaptionLoss(nn.Module):
         logits = logits.permute(0, 2, 1)
         text = text.long()
         # Compute cross-entropy loss, ignoring pad_id
-        caption_loss = F.cross_entropy(logits, text, ignore_index=self.pad_id)
+        mim_loss = F.cross_entropy(logits, text, ignore_index=self.pad_id)
 
-        return caption_loss
-
-# class CaptionLoss(torch.nn.Module):
-#     def __init__(self):
-#         super(CaptionLoss, self).__init__()
-#
-#     def forward(self, logits, text_embeds):
-#         # Normalize the vectors to get cosine similarity
-#         logits_norm = F.normalize(logits, p=2, dim=-1)
-#         text_embeds_norm = F.normalize(text_embeds, p=2, dim=-1)
-#
-#         # Compute cosine similarity
-#         cosine_similarity = torch.sum(logits_norm * text_embeds_norm, dim=-1)
-#
-#         # Compute cosine distance (1 - cosine similarity)
-#         cosine_distance = 1 - cosine_similarity
-#
-#         # Compute the mean loss over all elements
-#         loss = torch.mean(cosine_distance)
-#
-#         return loss
+        return mim_loss
 

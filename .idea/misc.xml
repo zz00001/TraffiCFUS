@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="ProjectRootManager" version="2" project-jdk-name="C:\Users\83512\anaconda3" project-jdk-type="Python SDK" />
+  <component name="Black">
+    <option name="sdkName" value="Remote Python 3.12.3 (sftp://sjy@47.101.36.150:6000/home/sjy/.virtualenvs/python_sjy/bin/python)" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.12.3 (sftp://sjy@47.101.36.150:6000/home/sjy/.virtualenvs/FSRU-main/bin/python) (2)" project-jdk-type="Python SDK" />
 </project>

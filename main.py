@@ -110,9 +110,9 @@ def main(args):
 
     train, valid = {}, {}
 
-    type_1 = dataset_type_dict[args.dataset_type[0]]
-    type_2 = dataset_type_dict[args.dataset_type[1]]
-    one_name, zero_name = type_1, type_2
+    type_0 = dataset_type_dict[args.dataset_type[0]]
+    type_1 = dataset_type_dict[args.dataset_type[1]]
+    one_name, zero_name = type_1, type_0
 
     for i in range(K):
         print('-' * 25, 'Fold:', i + 1, '-' * 25)
@@ -198,7 +198,6 @@ def main(args):
                         np.save(os.path.join(save_path, f"features.npy"), features)
                         np.save(os.path.join(save_path, f"labels.npy"), to_np(valid_labels))
 
-            # cur_valid_acc = np.mean(valid_acc)
             cur_valid_acc = metrics.accuracy_score(valid_y, valid_pred)
             valid_pre = metrics.precision_score(valid_y, valid_pred, average='macro')
             valid_recall = metrics.recall_score(valid_y, valid_pred, average='macro')
@@ -229,17 +228,16 @@ def main(args):
                 best_valid_recall = valid_recall
                 best_valid_f1 = valid_f1
                 print('Best...')
-                # print(metrics.classification_report(valid_y, valid_pred, digits=4))
-                target_names = ['non-rumor', 'rumor']
+                target_names = [type_0, type_1]
                 report = metrics.classification_report(valid_y, valid_pred, output_dict=True, target_names=target_names)
-                nr_report = report['non-rumor']
-                best_valid_nr_pre = nr_report['precision']
-                best_valid_nr_recall = nr_report['recall']
-                best_valid_nr_f1 = nr_report['f1-score']
-                r_report = report['rumor']
-                best_valid_r_pre = r_report['precision']
-                best_valid_r_recall = r_report['recall']
-                best_valid_r_f1 = r_report['f1-score']
+                type_0_report = report[type_0]
+                best_valid_0_pre = type_0_report['precision']
+                best_valid_0_recall = type_0_report['recall']
+                best_valid_0_f1 = type_0_report['f1-score']
+                type_1_report = report[type_1]
+                best_valid_1_pre = type_1_report['precision']
+                best_valid_1_recall = type_1_report['recall']
+                best_valid_1_f1 = type_1_report['f1-score']
 
         valid_acc_sum += best_valid_acc
         valid_pre_sum += best_valid_pre
@@ -247,25 +245,25 @@ def main(args):
         valid_f1_sum += best_valid_f1
         print('best_valid_acc:{:.6f}, best_valid_pre:{:.6f}, best_valid_recall:{:.6f}, best_valid_f1:{:.6f}'.
               format(best_valid_acc, best_valid_pre, best_valid_recall, best_valid_f1))
-        valid_type_0_pre_sum += best_valid_nr_pre
-        valid_type_0_recall_sum += best_valid_nr_recall
-        valid_type_0_f1_sum += best_valid_nr_f1
-        valid_type_1_pre_sum += best_valid_r_pre
-        valid_type_1_recall_sum += best_valid_r_recall
-        valid_type_1_f1_sum += best_valid_r_f1
+        valid_type_0_pre_sum += best_valid_0_pre
+        valid_type_0_recall_sum += best_valid_0_recall
+        valid_type_0_f1_sum += best_valid_0_f1
+        valid_type_1_pre_sum += best_valid_1_pre
+        valid_type_1_recall_sum += best_valid_1_recall
+        valid_type_1_f1_sum += best_valid_1_f1
 
         # Collect results for the current fold
         results = {
             'accuracy': best_valid_acc,
             'f1': best_valid_f1,
             'one_name': one_name,
-            'one_precision': best_valid_r_pre,
-            'one_recall': best_valid_r_recall,
-            'one_f1': best_valid_r_f1,
+            'one_precision': best_valid_1_pre,
+            'one_recall': best_valid_1_recall,
+            'one_f1': best_valid_1_f1,
             'zero_name': zero_name,
-            'zero_precision': best_valid_nr_pre,
-            'zero_recall': best_valid_nr_recall,
-            'zero_f1': best_valid_nr_f1
+            'zero_precision': best_valid_0_pre,
+            'zero_recall': best_valid_0_recall,
+            'zero_f1': best_valid_0_f1
         }
 
         # Save results for the current fold
