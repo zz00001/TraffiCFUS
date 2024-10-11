@@ -8,8 +8,6 @@ from collections import defaultdict
 from torchvision import transforms
 from dataset_type import dataset_type_dict
 
-print("data_loader.py loaded")
-
 def get_image(data_path, dataset_type):
     image_dict = {}
     train_type_0 = dataset_type_dict[dataset_type[0]]
