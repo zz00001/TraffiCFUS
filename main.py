@@ -136,6 +136,8 @@ def main(args):
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.l2)
 
         best_valid_acc, best_valid_pre, best_valid_recall, best_valid_f1 = 0., 0., 0., 0.
+        best_valid_0_pre, best_valid_0_recall, best_valid_0_f1 = 0., 0., 0.
+        best_valid_1_pre, best_valid_1_recall, best_valid_1_f1 = 0., 0., 0.
 
         loss_list = []
         acc_list = []
